@@ -748,6 +748,134 @@ atomic_load (Context *ctx, TyTy::FnType *fntype, int ordering)
   return fndecl;
 }
 
+static tree
+ctlz_handler (Context *ctx, TyTy::FnType *fntype, bool nonzero)
+{
+  rust_assert (fntype->get_params ().size () == 1);
+
+  tree lookup = NULL_TREE;
+  if (check_for_cached_intrinsic (ctx, fntype, &lookup))
+    return lookup;
+
+  auto fndecl = compile_intrinsic_function (ctx, fntype);
+
+  std::vector<Bvariable *> param_vars;
+  compile_fn_params (ctx, fntype, fndecl, &param_vars);
+
+  auto arg_param = param_vars.at (0);
+  if (!Backend::function_set_parameters (fndecl, param_vars))
+    return error_mark_node;
+
+  // Validate the generic type T is a basic integer type.
+  rust_assert (fntype->get_num_substitutions () == 1);
+  auto *monomorphized_type
+    = fntype->get_substs ().at (0).get_param_ty ()->resolve ();
+  if (!check_for_basic_integer_type ("ctlz", fntype->get_locus (),
+				     monomorphized_type))
+    return error_mark_node;
+
+  enter_intrinsic_block (ctx, fndecl);
+
+  // BUILTIN ctlz FN BODY BEGIN
+  auto locus = fntype->get_locus ();
+  auto arg_expr = Backend::var_expression (arg_param, locus);
+
+  tree arg_type = TREE_TYPE (arg_expr);
+  unsigned bit_size = TYPE_PRECISION (arg_type);
+  tree final_result_expr = error_mark_node;
+
+  // Select the right __builtin_clz variant and widen sub-word args,
+  // Rust integer widths are fixed (8/16/32/64), so we can case on exact values.
+  const char *builtin_name = nullptr;
+  tree call_arg = NULL_TREE;
+
+  switch (bit_size)
+    {
+    case 8:
+      // GCC has no clz8; promote to 32-bit and shift arg to the MSBs:
+      // clz32(arg << 24 | 0xffffff)
+      builtin_name = "__builtin_clz";
+      {
+	tree a = fold_convert (unsigned_type_node, arg_expr);
+	tree shifted = fold_build2 (LSHIFT_EXPR, unsigned_type_node, a,
+				    build_int_cst (unsigned_type_node, 24));
+	call_arg = fold_build2 (BIT_IOR_EXPR, unsigned_type_node, shifted,
+				build_int_cst (unsigned_type_node, 0xffffff));
+      }
+      break;
+
+    case 16:
+      // GCC has no clz16; promote to 32-bit:
+      // clz32(arg << 16 | 0xffff)
+      builtin_name = "__builtin_clz";
+      {
+	tree a = fold_convert (unsigned_type_node, arg_expr);
+	tree shifted = fold_build2 (LSHIFT_EXPR, unsigned_type_node, a,
+				    build_int_cst (unsigned_type_node, 16));
+	call_arg = fold_build2 (BIT_IOR_EXPR, unsigned_type_node, shifted,
+				build_int_cst (unsigned_type_node, 0xffff));
+      }
+      break;
+
+    case 32:
+      builtin_name = "__builtin_clz";
+      call_arg = fold_convert (unsigned_type_node, arg_expr);
+      break;
+
+    case 64:
+      builtin_name = "__builtin_clzll";
+      call_arg = fold_convert (long_long_unsigned_type_node, arg_expr);
+      break;
+
+    // TODO: handle 128-bit
+    default:
+      rust_sorry_at (locus, "ctlz for %u-bit integers is not yet implemented",
+		     bit_size);
+      return error_mark_node;
+    }
+
+  if (builtin_name != nullptr)
+    {
+      tree builtin_decl = error_mark_node;
+      BuiltinsContext::get ().lookup_simple_builtin (builtin_name,
+						     &builtin_decl);
+      rust_assert (builtin_decl != error_mark_node);
+
+      tree builtin_fn = build_fold_addr_expr_loc (locus, builtin_decl);
+      tree call
+	= Backend::call_expression (builtin_fn, {call_arg}, nullptr, locus);
+      // __builtin_clz returns int; convert to u32 to match the intrinsic's
+      // declared return type in rustc.
+      tree call_u32 = fold_convert (uint32_type_node, call);
+
+      if (!nonzero)
+	{
+	  // For 8/16-bit the shift+OR trick makes __builtin_clz(0) impossible,
+	  // but we apply the explicit guard uniformly for clarity.
+	  tree zero = build_int_cst (arg_type, 0);
+	  tree cmp = fold_build2 (EQ_EXPR, boolean_type_node, arg_expr, zero);
+	  tree width_cst = build_int_cst (uint32_type_node, bit_size);
+	  final_result_expr = fold_build3 (COND_EXPR, uint32_type_node, cmp,
+					   width_cst, call_u32);
+	}
+      else
+	{
+	  // ctlz_nonzero: caller guarantees arg != 0, pass directly
+	  // __builtin_clz(0) is UB so we don't need to guard
+	  final_result_expr = call_u32;
+	}
+    }
+
+  tree result
+    = fold_convert (TREE_TYPE (DECL_RESULT (fndecl)), final_result_expr);
+  auto return_stmt = Backend::return_statement (fndecl, result, locus);
+  ctx->add_statement (return_stmt);
+  // BUILTIN ctlz FN BODY END
+
+  finalize_intrinsic_block (ctx, fndecl);
+  return fndecl;
+}
+
 } // namespace inner
 
 const HandlerBuilder
@@ -1528,6 +1656,18 @@ bswap_handler (Context *ctx, TyTy::FnType *fntype)
   finalize_intrinsic_block (ctx, fndecl);
 
   return fndecl;
+}
+
+tree
+ctlz_handler (Context *ctx, TyTy::FnType *fntype)
+{
+  return inner::ctlz_handler (ctx, fntype, false);
+}
+
+tree
+ctlz_nonzero_handler (Context *ctx, TyTy::FnType *fntype)
+{
+  return inner::ctlz_handler (ctx, fntype, true);
 }
 
 } // namespace handlers
